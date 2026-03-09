@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 import contextlib
+import unittest
 
 import sympy
 
@@ -10,7 +11,8 @@ from torch._inductor.codegen.common import SizeArg
 from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.virtualized import V
-from torch.testing._internal.inductor_utils import HAS_CPU, HAS_GPU
+from torch.testing._internal.inductor_utils import HAS_CPU, HAS_GPU, HAS_GPU_AND_TRITON
+from torch._inductor.utils import run_and_get_code
 
 
 class TestCodegenTriton(InductorTestCase):
@@ -113,6 +115,22 @@ class TestCodegenTriton(InductorTestCase):
         self.assertTrue(
             V.graph.sizevars.statically_known_multiple_of(s2, 16),
         )
+
+
+    @unittest.skipUnless(
+        torch.version.hip is not None, "pointer_range_32 is HIP-only"
+    )
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    def test_pointer_range_in_generated_code(self):
+        """Verify tt.pointer_range=32 appears in generated Triton code on HIP."""
+
+        def fn(x):
+            return x + 1
+
+        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        _, code = run_and_get_code(torch.compile(fn), x)
+        code_str = " ".join(code)
+        self.assertIn("tt.pointer_range", code_str)
 
 
 if __name__ == "__main__":
