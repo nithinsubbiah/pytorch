@@ -10,9 +10,14 @@ from torch._inductor.codegen import triton_utils
 from torch._inductor.codegen.common import SizeArg
 from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase as InductorTestCase
-from torch._inductor.virtualized import V
 from torch._inductor.utils import run_and_get_code
-from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_CPU, HAS_GPU, HAS_GPU_AND_TRITON
+from torch._inductor.virtualized import V
+from torch.testing._internal.inductor_utils import (
+    GPU_TYPE,
+    HAS_CPU,
+    HAS_GPU,
+    HAS_GPU_AND_TRITON,
+)
 
 
 class TestCodegenTriton(InductorTestCase):
