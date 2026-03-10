@@ -11,8 +11,8 @@ from torch._inductor.codegen.common import SizeArg
 from torch._inductor.graph import GraphLowering
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.virtualized import V
-from torch.testing._internal.inductor_utils import HAS_CPU, HAS_GPU, HAS_GPU_AND_TRITON
 from torch._inductor.utils import run_and_get_code
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_CPU, HAS_GPU, HAS_GPU_AND_TRITON
 
 
 class TestCodegenTriton(InductorTestCase):
@@ -127,7 +127,7 @@ class TestCodegenTriton(InductorTestCase):
         def fn(x):
             return x + 1
 
-        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(64, 64, device=GPU_TYPE, dtype=torch.bfloat16)
         _, code = run_and_get_code(torch.compile(fn), x)
         code_str = " ".join(code)
         self.assertIn("tt.pointer_range", code_str)
