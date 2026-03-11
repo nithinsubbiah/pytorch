@@ -121,10 +121,7 @@ class TestCodegenTriton(InductorTestCase):
             V.graph.sizevars.statically_known_multiple_of(s2, 16),
         )
 
-
-    @unittest.skipUnless(
-        torch.version.hip is not None, "pointer_range_32 is HIP-only"
-    )
+    @unittest.skipUnless(torch.version.hip is not None, "pointer_range_32 is HIP-only")
     @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
     def test_pointer_range_in_generated_code(self):
         """Verify tt.pointer_range=32 appears in generated Triton code on HIP."""
