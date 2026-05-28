@@ -29,7 +29,10 @@
     # BLOCKS_ARE_CONTIGUOUS: Is it guaranteed that all blocks in the mask are
     # contiguous? If so, we don't need to do an indirect jump for every block
 
-    tl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
+    tl.static_assert(
+        (SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0) or
+        (BLOCK_M > SPARSE_Q_BLOCK_SIZE and BLOCK_M % SPARSE_Q_BLOCK_SIZE == 0 and BLOCKS_ARE_CONTIGUOUS)
+    )
     tl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
 
     # Define strides of inputs
@@ -96,7 +99,7 @@
     sparse_idx_z = off_zq % SPARSE_Z
     sparse_idx_hq = off_hq % SPARSE_HQ
 
-    SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
+    MULTI_SPARSE_Q: tl.constexpr = (BLOCK_M > SPARSE_Q_BLOCK_SIZE)
     SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
 
     stride_kv_num_blks_h = {{stride("KV_NUM_BLKS", 1)}}
@@ -117,12 +120,53 @@
 
     # KV_IDX and KV_NUM_BLKS are always contiguous.
     sparse_hz_offset = sparse_idx_z * SPARSE_HQ + sparse_idx_hq
-    sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
-    sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
-    {%- if HAS_FULL_BLOCKS %}
-    sparse_full_kv_num_blks_offset = sparse_hz_offset * stride_full_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
-    sparse_full_kv_idx_offset = sparse_hz_offset * stride_full_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_full_kv_idx_m  # noqa: B950
-    {%- endif %}
+
+    if MULTI_SPARSE_Q:
+        Q_PER_SPARSE: tl.constexpr = (BLOCK_M // SPARSE_Q_BLOCK_SIZE)
+        tl.static_assert(Q_PER_SPARSE <= 2, "merge only checks first and last sparse-Q rows")
+        first_sparse_q = q_start * Q_PER_SPARSE
+        last_sparse_q = first_sparse_q + Q_PER_SPARSE - 1
+
+        first_kv_num_offset = sparse_hz_offset * stride_kv_num_blks_h + first_sparse_q
+        last_kv_num_offset = sparse_hz_offset * stride_kv_num_blks_h + last_sparse_q
+        first_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + first_sparse_q * stride_kv_idx_m
+        last_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + last_sparse_q * stride_kv_idx_m
+
+        kv_start_first = tl.load(KV_IDX + first_kv_idx_offset)
+        kv_start_last = tl.load(KV_IDX + last_kv_idx_offset)
+        kv_num_first = tl.load(KV_NUM_BLKS + first_kv_num_offset)
+        kv_num_last = tl.load(KV_NUM_BLKS + last_kv_num_offset)
+
+        merged_kv_start = tl.minimum(kv_start_first, kv_start_last)
+        merged_kv_end = tl.maximum(kv_start_first + kv_num_first, kv_start_last + kv_num_last)
+        merged_kv_num_blocks = merged_kv_end - merged_kv_start
+
+        sparse_kv_idx_offset = first_kv_idx_offset
+        {%- if HAS_FULL_BLOCKS %}
+        first_full_kv_num_offset = sparse_hz_offset * stride_full_kv_num_blks_h + first_sparse_q
+        last_full_kv_num_offset = sparse_hz_offset * stride_full_kv_num_blks_h + last_sparse_q
+        first_full_kv_idx_offset = sparse_hz_offset * stride_full_kv_idx_h + first_sparse_q * stride_full_kv_idx_m
+        last_full_kv_idx_offset = sparse_hz_offset * stride_full_kv_idx_h + last_sparse_q * stride_full_kv_idx_m
+
+        full_kv_start_first = tl.load(FULL_KV_IDX + first_full_kv_idx_offset)
+        full_kv_start_last = tl.load(FULL_KV_IDX + last_full_kv_idx_offset)
+        full_kv_num_first = tl.load(FULL_KV_NUM_BLKS + first_full_kv_num_offset)
+        full_kv_num_last = tl.load(FULL_KV_NUM_BLKS + last_full_kv_num_offset)
+
+        merged_full_kv_start = tl.maximum(full_kv_start_first, full_kv_start_last)
+        merged_full_kv_end = tl.minimum(full_kv_start_first + full_kv_num_first, full_kv_start_last + full_kv_num_last)
+        merged_full_kv_num_blocks = tl.maximum(merged_full_kv_end - merged_full_kv_start, 0)
+
+        sparse_full_kv_idx_offset = first_full_kv_idx_offset
+        {%- endif %}
+    else:
+        SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
+        sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
+        sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
+        {%- if HAS_FULL_BLOCKS %}
+        sparse_full_kv_num_blks_offset = sparse_hz_offset * stride_full_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
+        sparse_full_kv_idx_offset = sparse_hz_offset * stride_full_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_full_kv_idx_m  # noqa: B950
+        {%- endif %}
 
     {%- if USE_TMA %}
     q = tl.load_tensor_descriptor(
@@ -139,8 +183,12 @@
     # We don't know anything "special" about these blocks, so we need to apply
     # both score_mod and mask_mod to it
     kv_indices = KV_IDX + sparse_kv_idx_offset
-    kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
-    kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
+    if MULTI_SPARSE_Q:
+        kv_start = merged_kv_start * SPARSE_KV_BLOCK_SIZE
+        kv_num_blocks = merged_kv_num_blocks
+    else:
+        kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE
+        kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
     block_n_end = tl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
 
 
@@ -169,8 +217,12 @@
     if HAS_FULL_BLOCKS:
         # FULL_KV_IDX and FULL_KV_NUM_BLKS are always contiguous.
         kv_indices = FULL_KV_IDX + sparse_full_kv_idx_offset
-        kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
-        kv_num_blocks = tl.load(FULL_KV_NUM_BLKS + sparse_full_kv_num_blks_offset)
+        if MULTI_SPARSE_Q:
+            kv_start = merged_full_kv_start * SPARSE_KV_BLOCK_SIZE
+            kv_num_blocks = merged_full_kv_num_blocks
+        else:
+            kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE
+            kv_num_blocks = tl.load(FULL_KV_NUM_BLKS + sparse_full_kv_num_blks_offset)
         block_n_end = tl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
         # K and V pointers will be passed directly to forward_inner
         offs_n = kv_start + tl.arange(0, BLOCK_N)

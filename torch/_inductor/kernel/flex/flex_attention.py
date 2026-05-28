@@ -384,7 +384,12 @@ def flex_attention(
     dtype = query.get_dtype()
     head_dim = V.graph.sizevars.guard_int(query.get_size()[-1])
     configs: list[FlexConfig] = V.choices.get_flex_attention_fwd_configs(
-        head_dim, dtype, query.get_device().type
+        head_dim,
+        dtype,
+        query.get_device().type,
+        blocks_are_contiguous=kernel_options.get("BLOCKS_ARE_CONTIGUOUS", False),
+        seq_len_q=V.graph.sizevars.guard_int(seq_len_q),
+        batch_heads=V.graph.sizevars.guard_int(B * Hq),
     )
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
@@ -429,17 +434,21 @@ def flex_attention(
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
         cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", SPARSE_KV_BLOCK_SIZE)
 
-        if (
-            cur_kernel_options["SPARSE_KV_BLOCK_SIZE"] % cur_kernel_options["BLOCK_N"]
-            != 0
-            or cur_kernel_options["SPARSE_Q_BLOCK_SIZE"] % cur_kernel_options["BLOCK_M"]
-            != 0
-        ):
+        sparse_kv = cur_kernel_options["SPARSE_KV_BLOCK_SIZE"]
+        block_n = cur_kernel_options["BLOCK_N"]
+        sparse_q = cur_kernel_options["SPARSE_Q_BLOCK_SIZE"]
+        block_m = cur_kernel_options["BLOCK_M"]
+        kv_invalid = sparse_kv % block_n != 0
+        q_invalid = sparse_q % block_m != 0 and not (
+            block_m > sparse_q
+            and block_m % sparse_q == 0
+            and cur_kernel_options.get("BLOCKS_ARE_CONTIGUOUS", False)
+        )
+        if kv_invalid or q_invalid:
             if len(configs) == 1:
                 raise ValueError(
                     f"Q and KV block size must be divisible by BLOCK_M and BLOCK_N. We "
-                    f"got Q_BLOCK_SIZE={cur_kernel_options['SPARSE_Q_BLOCK_SIZE']} and "
-                    f"KV_BLOCK_SIZE={cur_kernel_options['SPARSE_KV_BLOCK_SIZE']}."
+                    f"got Q_BLOCK_SIZE={sparse_q} and KV_BLOCK_SIZE={sparse_kv}."
                 )
             continue
 

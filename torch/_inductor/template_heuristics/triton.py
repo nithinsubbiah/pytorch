@@ -1169,7 +1169,9 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         ]
 
     # Flex attn helpers
-    def get_flex_attn_fwd_configs(self, head_dim: int, dtype: Any) -> list[FlexConfig]:
+    def get_flex_attn_fwd_configs(
+        self, head_dim: int, dtype: Any, **kwargs: Any
+    ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
         if config.max_autotune:
@@ -1378,7 +1380,9 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
             if BLOCK_N % BLOCK_M == 0
         ]
 
-    def get_flex_attn_fwd_configs(self, head_dim: int, dtype: Any) -> list[FlexConfig]:
+    def get_flex_attn_fwd_configs(
+        self, head_dim: int, dtype: Any, **kwargs: Any
+    ) -> list[FlexConfig]:
         capability = torch.cuda.get_device_capability()
         flex_attn_fwd_configs: list[FlexConfig] = []
 
@@ -1647,6 +1651,10 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             for BLOCK1 in [16, 64, 128]
             for BLOCK2 in [16, 32, 64, 128]
             for w in [4, 8]
+        ] + [
+            ROCmFlexConfig(256, BLOCK_N, s, 8, waves_per_eu=2, kpack=default_kpack)
+            for BLOCK_N in [64]
+            for s in [2, 3, 4]
         ]
 
         self.flex_attn_bwd_autotune_configs: list[FlexBwDConfig] = [
@@ -1672,9 +1680,9 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
 
         self.exhaustive_flex_attn_fwd_configs: list[FlexConfig] = [
             ROCmFlexConfig(BLOCK_M, BLOCK_N, num_stages, num_warps, mfma, wpeu, kpack)
-            for BLOCK_M in [16, 32, 64, 128]
+            for BLOCK_M in [16, 32, 64, 128, 256]
             for BLOCK_N in [32, 64, 128]
-            for num_stages in [1, 2]
+            for num_stages in [1, 2, 3, 4]
             for num_warps in [2, 4, 8]
             for mfma in [0, 16]
             for wpeu in [0, int(8 // num_warps)]
@@ -1816,7 +1824,10 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
                     kwargs["GROUP_M"] = group_m
                 yield self.triton_config(**kwargs)
 
-    def get_flex_attn_fwd_configs(self, head_dim: int, dtype: Any) -> list[FlexConfig]:
+    def get_flex_attn_fwd_configs(
+        self, head_dim: int, dtype: Any, **kwargs: Any
+    ) -> list[FlexConfig]:
+        blocks_are_contiguous = kwargs.get("blocks_are_contiguous", False)
         flex_attn_fwd_configs: list[FlexConfig] = []
 
         if config.max_autotune:
@@ -1840,6 +1851,14 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
                 default_config = self.gfx942_default_flex_config.get(
                     (dtype, head_dim), default_config
                 )
+            if blocks_are_contiguous and dtype != torch.float32 and head_dim <= 128:
+                seq_len_q = kwargs.get("seq_len_q", 0)
+                batch_heads = kwargs.get("batch_heads", 0)
+                grid_256 = (seq_len_q // 256) * batch_heads
+                if grid_256 >= 256:
+                    default_config = ROCmFlexConfig(
+                        256, 64, 3, 8, waves_per_eu=2, kpack=default_kpack
+                    )
         else:
             if dtype == torch.float32:
                 default_config = ROCmFlexConfig(32, 16, 1, 4, kpack=default_kpack)
@@ -1964,7 +1983,9 @@ class XPUConfigHeuristic(BaseConfigHeuristic):
                 FlexDecodeConfig(64, 2, 1),
             ]
 
-    def get_flex_attn_fwd_configs(self, head_dim: int, dtype: Any) -> list[FlexConfig]:
+    def get_flex_attn_fwd_configs(
+        self, head_dim: int, dtype: Any, **kwargs: Any
+    ) -> list[FlexConfig]:
         flex_attn_fwd_configs: list[FlexConfig] = []
 
         if config.max_autotune:
