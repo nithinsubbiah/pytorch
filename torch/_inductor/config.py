@@ -2912,6 +2912,10 @@ _cache_config_factory_keys: list[str] = [
 # External callable for matmul tuning candidates
 external_matmul: list[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]] = []
 
+# Experimental: offer a Gluon (Triton low-level frontend) template as an mm
+# autotuning choice. Prototype only.
+gluon_mm: bool = False
+
 write_are_deterministic_algorithms_enabled = (
     os.getenv("TORCHINDUCTOR_WRITE_ARE_DETERMINISTIC_ALGORITHMS_ENABLED", "1") == "1"
 )

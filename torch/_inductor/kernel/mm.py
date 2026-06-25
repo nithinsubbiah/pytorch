@@ -137,6 +137,13 @@ def lazy_register_extern_choice(fn):
     return ExternKernelChoice(fn)
 
 
+@functools.cache
+def _get_gluon_mm_template():
+    from ..codegen.gluon.gluon_template import GluonTemplate
+
+    return GluonTemplate(name="mm", source=load_kernel_template("gluon_mm"))
+
+
 aten_mm = ExternKernelChoice(torch.mm, "at::mm_out", op_overload=aten.mm.out)
 aten_mm_dtype = ExternKernelChoice(
     torch.mm,
@@ -536,6 +543,15 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
             choices.append(
                 lazy_register_extern_choice(k).bind(kernel_inputs.nodes(), layout)
             )
+
+    if out_dtype is None and is_nonzero and inductor_config.gluon_mm:
+        _get_gluon_mm_template().maybe_append_choice(
+            choices,
+            input_nodes=(mat1, mat2),
+            layout=layout,
+            BLOCK_M=64,
+            BLOCK_N=64,
+        )
 
     best_config_future = None
     if out_dtype is None and torch._inductor.config.remote_gemm_autotune_cache:

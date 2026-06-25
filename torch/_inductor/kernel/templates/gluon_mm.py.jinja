@@ -1,0 +1,42 @@
+{{gen_defines()}}
+
+@gluon.jit
+def {{kernel_name}}_kernel(
+    A, B, C, M, N, K,
+    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+):
+    num_warps: gl.constexpr = gl.num_warps()
+    tpw: gl.constexpr = 64
+    blocked: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8], threads_per_warp=[tpw // 4, 4],
+        warps_per_cta=[num_warps, 1], order=[1, 0],
+    )
+    row_l: gl.constexpr = gl.SliceLayout(dim=1, parent=blocked)
+    col_l: gl.constexpr = gl.SliceLayout(dim=0, parent=blocked)
+    pid_m = gl.program_id(0)
+    pid_n = gl.program_id(1)
+    offs_m = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=row_l)
+    offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=col_l)
+    acc = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=blocked)
+    for k in range(0, K):
+        a_col = gl.load(A + offs_m * stride_am + k * stride_ak, mask=offs_m < M, other=0.0)
+        b_row = gl.load(B + k * stride_bk + offs_n * stride_bn, mask=offs_n < N, other=0.0)
+        acc = acc + a_col[:, None].to(gl.float32) * b_row[None, :].to(gl.float32)
+    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    gl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=c_mask)
+
+
+{{def_kernel("input_a", "input_b")}}
+    C = {{get_output()}}
+    M, K = input_a.shape
+    Kb, N = input_b.shape
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    {{kernel_name}}_kernel[grid](
+        input_a, input_b, C, M, N, K,
+        input_a.stride(0), input_a.stride(1),
+        input_b.stride(0), input_b.stride(1),
+        C.stride(0), C.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, num_warps=4,
+    )

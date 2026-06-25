@@ -734,6 +734,33 @@ class AsyncCompile:
             future = self.submit(task)
             return LambdaFuture(lambda: future.result())
 
+    def gluon(self, kernel_name: str, source_code: str):
+        """Compile an experimental Gluon (Triton low-level frontend) kernel."""
+        from torch._inductor.codegen.gluon.gluon_kernel import (
+            GluonKernelWrapper,
+            MAIN_SUFFIX,
+        )
+
+        kernel_code_log.info("Gluon Kernel:\n%s", source_code)
+
+        def task():
+            key, path = torch._inductor.codecache.PyCodeCache.write(source_code)
+            mod = torch._inductor.codecache.PyCodeCache.load_by_key_path(key, path)
+            main_func_name = f"{kernel_name}_{MAIN_SUFFIX}"
+            if not hasattr(mod, main_func_name):
+                available = [name for name in dir(mod) if callable(getattr(mod, name))]
+                raise RuntimeError(
+                    f"Could not find Gluon main kernel function '{main_func_name}'. "
+                    f"Available callables: {available}"
+                )
+            return GluonKernelWrapper(getattr(mod, main_func_name), kernel_path=path)
+
+        if get_compile_threads() <= 1:
+            return task()
+        else:
+            future = self.submit(task)
+            return LambdaFuture(lambda: future.result())
+
     def nv_universal_gemm(
         self, kernel_name: str, source_code: str, precompile_metadata=None
     ):
