@@ -191,6 +191,21 @@ def skip_on_xpu(test_func):
 skip_on_mps = skipMPSIf(True, "Not supported on MPS")
 
 
+def _is_gfx95x() -> bool:
+    """True on the AMD architecture the Gluon flex-attention template targets."""
+    if not (torch.cuda.is_available() and torch.version.hip):
+        return False
+    try:
+        return "gfx95" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+requires_gfx95x = skipUnless(
+    _is_gfx95x(), "Gluon flex-attention is only offered on AMD gfx95x"
+)
+
+
 def _is_not_implemented_exc(exc):
     """True if `exc` is or wraps a NotImplementedError (Dynamo/Inductor wrap it)."""
     seen = set()
@@ -10377,6 +10392,190 @@ class TestLearnableBiases(InductorTestCase):
                 ref_error * 1.2 >= flex_error,
                 lambda msg: f"{msg}\n{name} -> Ref error: {ref_error}, Flex eager Error: {flex_error}",
             )
+
+
+@requires_gfx95x
+class TestGluonFlexAttention(InductorTestCase):
+    """The Gluon (Triton low-level frontend) flex-attention template on gfx95x.
+
+    The template is an extra autotuning candidate, so these tests force it with
+    ``autotune_choice_name_regex`` and assert a Gluon kernel was really emitted --
+    without that check a green test would only prove the Triton template is correct.
+    """
+
+    B, H, S = 2, 4, 512
+    TOL = {torch.float16: 2e-2, torch.bfloat16: 3e-2}
+
+    def _inputs(self, dtype, head_dim):
+        torch.manual_seed(0)
+        return [
+            torch.randn(self.B, self.H, self.S, head_dim, device="cuda", dtype=dtype)
+            for _ in range(3)
+        ]
+
+    @staticmethod
+    def _emitted_gluon(code):
+        src = "\n".join(code) if isinstance(code, (list, tuple)) else str(code)
+        return "@gluon.jit" in src
+
+    def _patches(self, *, enabled=True, force=True):
+        from torch._inductor.kernel.flex.gluon_flex import (
+            enable_gluon_flex_attention,
+            GluonInductorChoices,
+        )
+
+        # Go through the real entry point once: it serializes Triton compilation,
+        # without which concurrent Gluon compiles segfault the process about half
+        # the time. config.patch cannot do it, since the autotune thread pool reads
+        # TORCHINDUCTOR_COMPILE_THREADS from the environment.
+        enable_gluon_flex_attention()
+
+        return config.patch(
+            {
+                "max_autotune": True,
+                "force_disable_caches": True,
+                "gluon_flex_attention": enabled,
+                "inductor_choices_class": GluonInductorChoices,
+                "test_configs.autotune_choice_name_regex": (
+                    "gluon_flex_attention" if force else None
+                ),
+            }
+        )
+
+    def _compile(self, fn, args, *, enabled=True, force=True):
+        torch._dynamo.reset()
+        with self._patches(enabled=enabled, force=force):
+            out, code = run_and_get_code(torch.compile(fn, fullgraph=True), *args)
+        torch.cuda.synchronize()
+        return out, code
+
+    def _check(self, *, dtype, head_dim, mask_fn=None, score_mod=None):
+        q, k, v = self._inputs(dtype, head_dim)
+        scale = head_dim**-0.5
+        block_mask = (
+            create_block_mask(mask_fn, self.B, self.H, self.S, self.S, device="cuda")
+            if mask_fn is not None
+            else None
+        )
+
+        def fn(q, k, v):
+            return flex_attention(
+                q, k, v, score_mod=score_mod, block_mask=block_mask, scale=scale
+            )
+
+        expected = fn(q, k, v)
+        actual, code = self._compile(fn, (q, k, v))
+        self.assertTrue(self._emitted_gluon(code), "no Gluon kernel was emitted")
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=self.TOL[dtype], rtol=self.TOL[dtype]
+        )
+
+    def test_score_and_mask_mods(self):
+        """Identity, mask_mod-only, and both score_mod flavours the template branches on."""
+        for name, mask_fn, score_mod in (
+            ("identity", None, None),
+            ("causal", lambda b, h, m, n: m >= n, None),
+            ("softcap", None, lambda s, b, h, m, n: 20.0 * torch.tanh(s / 20.0)),
+            ("head_bias", None, lambda s, b, h, m, n: s - 0.125 * h),
+        ):
+            with self.subTest(case=name):
+                self._check(
+                    dtype=torch.float16,
+                    head_dim=64,
+                    mask_fn=mask_fn,
+                    score_mod=score_mod,
+                )
+
+    def test_dtypes_and_head_dims(self):
+        """Both supported head dims, since each selects a different DMA staging layout."""
+        for dtype, head_dim, mask_fn in (
+            (torch.bfloat16, 64, lambda b, h, m, n: m >= n),
+            (torch.float16, 128, lambda b, h, m, n: m >= n),
+            (torch.bfloat16, 128, None),
+        ):
+            with self.subTest(dtype=dtype, head_dim=head_dim):
+                self._check(dtype=dtype, head_dim=head_dim, mask_fn=mask_fn)
+
+    def test_logsumexp(self):
+        """LSE feeds the backward pass, so a wrong one is invisible in the output."""
+        for dtype, mask_fn in (
+            (torch.float16, None),
+            (torch.bfloat16, lambda b, h, m, n: m >= n),
+        ):
+            with self.subTest(dtype=dtype, masked=mask_fn is not None):
+                q, k, v = self._inputs(dtype, 64)
+                block_mask = (
+                    create_block_mask(
+                        mask_fn, self.B, self.H, self.S, self.S, device="cuda"
+                    )
+                    if mask_fn is not None
+                    else None
+                )
+
+                def fn(q, k, v):
+                    return flex_attention(
+                        q, k, v, block_mask=block_mask, scale=0.125, return_lse=True
+                    )
+
+                ref_out, ref_lse = fn(q, k, v)
+                (out, lse), code = self._compile(fn, (q, k, v))
+                self.assertTrue(self._emitted_gluon(code))
+                tol = self.TOL[dtype]
+                torch.testing.assert_close(
+                    out.float(), ref_out.float(), atol=tol, rtol=tol
+                )
+                torch.testing.assert_close(
+                    lse.float(), ref_lse.float(), atol=tol, rtol=tol
+                )
+
+    def test_fully_masked_rows(self):
+        """Rows with no legal key: the -inf row max must not become NaN."""
+        q, k, v = self._inputs(torch.float16, 64)
+        block_mask = create_block_mask(
+            lambda b, h, m, n: m < 0, self.B, self.H, self.S, self.S, device="cuda"
+        )
+
+        def fn(q, k, v):
+            return flex_attention(q, k, v, block_mask=block_mask, scale=0.125)
+
+        expected = fn(q, k, v)
+        actual, _ = self._compile(fn, (q, k, v))
+        self.assertTrue(
+            torch.isfinite(actual).all(), "masked-out rows produced NaN/inf"
+        )
+        self.assertEqual(float(actual.abs().max()), 0.0)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=2e-2, rtol=2e-2
+        )
+
+    def test_unforced_autotune_winner_is_correct(self):
+        """How a user actually runs it: the Gluon body only competes, and may lose."""
+        q, k, v = self._inputs(torch.float16, 64)
+
+        def fn(q, k, v):
+            return flex_attention(q, k, v, scale=0.125)
+
+        expected = fn(q, k, v)
+        actual, _ = self._compile(fn, (q, k, v), force=False)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=2e-2, rtol=2e-2
+        )
+
+    def test_disabled_is_a_no_op(self):
+        """With the config flag off, no Gluon kernel may be emitted."""
+        q, k, v = self._inputs(torch.float16, 64)
+
+        def fn(q, k, v):
+            return flex_attention(q, k, v, scale=0.125)
+
+        expected = fn(q, k, v)
+        actual, code = self._compile(fn, (q, k, v), enabled=False, force=False)
+        self.assertFalse(
+            self._emitted_gluon(code), "Gluon kernel emitted while the flag was off"
+        )
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=2e-2, rtol=2e-2
+        )
 
 
 instantiate_device_type_tests(
